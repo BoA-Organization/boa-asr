@@ -21,6 +21,15 @@ DEVICE_ID = int(os.getenv("GPU_ID", "0"))
 DEVICE = f"cuda:{DEVICE_ID}"
 DTYPE = torch.float16
 
+# Limits
+MAX_FILE_SIZE_BYTES = 100 * 1024 * 1024  # 100 MB
+MAX_AUDIO_DURATION_SECONDS = 40.0
+TARGET_SAMPLE_RATE = 16000
+
+# Keep-alive settings
+KEEP_ALIVE_ENABLED = os.getenv("KEEP_ALIVE_ENABLED", "true").lower() == "true"
+KEEP_ALIVE_INTERVAL_SECONDS = int(os.getenv("KEEP_ALIVE_INTERVAL_SECONDS", "30"))  # 30 seconds for maximum GPU activity
+
 processor = None
 model = None
 asr_pipeline = None
@@ -28,10 +37,57 @@ asr_pipeline = None
 # Prevent multiple requests from running on the same model simultaneously.
 inference_lock = asyncio.Lock()
 
+# Keep-alive task
+keep_alive_task = None
+shutdown_event = asyncio.Event()
+
+
+def warmup_model():
+    """Run a dummy inference to warm up the GPU and model."""
+    print("Warming up the model...")
+    
+    # Create a 1-second silent audio clip
+    dummy_audio = np.zeros(TARGET_SAMPLE_RATE, dtype=np.float32)
+    
+    with torch.inference_mode():
+        asr_pipeline(
+            {
+                "array": dummy_audio,
+                "sampling_rate": TARGET_SAMPLE_RATE,
+            },
+            generate_kwargs={
+                "task": "transcribe",
+                "language": "am",
+            },
+        )
+    
+    print("Model warmup completed.")
+
+
+async def keep_alive_loop():
+    """Periodically run dummy inference to keep GPU warm."""
+    print(f"Keep-alive enabled: running warmup every {KEEP_ALIVE_INTERVAL_SECONDS} seconds")
+    
+    while not shutdown_event.is_set():
+        try:
+            await asyncio.sleep(KEEP_ALIVE_INTERVAL_SECONDS)
+            
+            if shutdown_event.is_set():
+                break
+            
+            async with inference_lock:
+                await asyncio.to_thread(warmup_model)
+                
+        except asyncio.CancelledError:
+            print("Keep-alive task cancelled")
+            break
+        except Exception as error:
+            print(f"Keep-alive error: {error}")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global processor, model, asr_pipeline
+    global processor, model, asr_pipeline, keep_alive_task
 
     if not torch.cuda.is_available():
         raise RuntimeError(
@@ -81,7 +137,24 @@ async def lifespan(app: FastAPI):
 
     print(f"Model loaded on: {next(model.parameters()).device}")
 
+    # Initial warmup
+    warmup_model()
+
+    # Start keep-alive task
+    if KEEP_ALIVE_ENABLED:
+        keep_alive_task = asyncio.create_task(keep_alive_loop())
+
     yield
+
+    # Shutdown
+    shutdown_event.set()
+    
+    if keep_alive_task:
+        keep_alive_task.cancel()
+        try:
+            await keep_alive_task
+        except asyncio.CancelledError:
+            pass
 
     del asr_pipeline
     del model
@@ -125,7 +198,37 @@ def health():
         "pytorch_cuda": torch.version.cuda,
         "supported_architectures": torch.cuda.get_arch_list(),
         "device": str(next(model.parameters()).device),
+        "keep_alive_enabled": KEEP_ALIVE_ENABLED,
+        "keep_alive_interval_seconds": KEEP_ALIVE_INTERVAL_SECONDS if KEEP_ALIVE_ENABLED else None,
     }
+
+
+@app.post("/warmup")
+async def warmup_endpoint():
+    """Manual warmup endpoint to pre-warm the GPU."""
+    if asr_pipeline is None:
+        raise HTTPException(
+            status_code=503,
+            detail="ASR model is not ready.",
+        )
+    
+    try:
+        started_at = time.perf_counter()
+        
+        async with inference_lock:
+            await asyncio.to_thread(warmup_model)
+        
+        elapsed = time.perf_counter() - started_at
+        
+        return {
+            "status": "warmup_completed",
+            "warmup_time_seconds": round(elapsed, 3),
+        }
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Warmup failed: {type(error).__name__}: {error}",
+        ) from error
 
 
 @app.post("/transcribe")
@@ -143,6 +246,17 @@ async def transcribe(file: UploadFile = File(...)):
             raise HTTPException(
                 status_code=400,
                 detail="The uploaded audio file is empty.",
+            )
+
+        # Check file size limit
+        file_size = len(content)
+        if file_size > MAX_FILE_SIZE_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"File size ({file_size / (1024 * 1024):.2f} MB) exceeds "
+                    f"maximum allowed size of {MAX_FILE_SIZE_BYTES / (1024 * 1024):.0f} MB."
+                ),
             )
 
         try:
@@ -179,19 +293,22 @@ async def transcribe(file: UploadFile = File(...)):
             neginf=0.0,
         ).astype(np.float32)
 
-        if sample_rate != 16000:
+        if sample_rate != TARGET_SAMPLE_RATE:
             audio = librosa.resample(
                 audio,
                 orig_sr=sample_rate,
-                target_sr=16000,
+                target_sr=TARGET_SAMPLE_RATE,
             ).astype(np.float32)
 
-        duration_seconds = len(audio) / 16000
+        duration_seconds = len(audio) / TARGET_SAMPLE_RATE
 
-        if duration_seconds < 0.1:
+        if duration_seconds > MAX_AUDIO_DURATION_SECONDS:
             raise HTTPException(
-                status_code=400,
-                detail="The audio is too short to transcribe.",
+                status_code=413,
+                detail=(
+                    f"Audio duration ({duration_seconds:.2f} seconds) exceeds "
+                    f"maximum allowed duration of {MAX_AUDIO_DURATION_SECONDS} seconds."
+                ),
             )
 
         started_at = time.perf_counter()
@@ -202,7 +319,7 @@ async def transcribe(file: UploadFile = File(...)):
                     asr_pipeline,
                     {
                         "array": audio,
-                        "sampling_rate": 16000,
+                        "sampling_rate": TARGET_SAMPLE_RATE,
                     },
                     generate_kwargs={
                         "task": "transcribe",
